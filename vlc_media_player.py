@@ -1,14 +1,18 @@
 """
-    VLC media player for local and online streaming media
-    Author: Israel Dryer
-    Modified: 2020-01-23
+    VLC media player for local and online streaming media, adapted for bee audio classification.
+    Author: Israel Dryer, Chris Campell
+    Modified: 2022-06-23
 
 """
+from typing import Optional, List
+
 import vlc
 import pafy
 import PySimpleGUI as sg
 from sys import platform as PLATFORM
 from os import listdir
+from utils.pathing import local_mounted_network_drive_source_audio_path_to_remote_server_absolute_audio_path
+from loguru import logger
 
 PATH = './Assets/'
 BUTTON_DICT = {img[:-4].upper(): PATH + img for img in listdir(PATH)}
@@ -31,6 +35,14 @@ class MediaPlayer:
         self.track_cnt = 0  # Count of tracks loaded into `media_list`
         self.track_num = 0  # Index of the track currently playing
 
+        self._previous_track: Optional[str] = None
+        self._track: Optional[str] = None
+        self._next_track: Optional[str] = None
+        self._bees_only_track_numbers: List[int] = []
+        self._bees_and_other_noise_track_numbers: List[int] = []
+        self._labeled_audio_files = {}
+        # self._bees_only_track_numbers_and_
+
         # Setup GUI window for output of media
         self.theme = theme  # This can be changed, but I'd stick with a dark theme
         self.default_bg_color = sg.LOOK_AND_FEEL_TABLE[self.theme]['BACKGROUND']
@@ -52,6 +64,27 @@ class MediaPlayer:
         """ Create GUI instance """
         sg.change_look_and_feel(self.theme)
 
+        # Button for labeling as only bee noise:
+        bee_only_button = sg.Button(
+            button_text="Bee Noise Only",
+            image_filename=BUTTON_DICT['BEE2'],
+            border_width=1,
+            pad=(0, 0),
+            key='BEES ONLY',
+            button_color=('white', self.default_bg_color),
+            enable_events=True
+        )
+        # Button for labeling as bees + some other noise:
+        bee_and_other_noise_button = sg.Button(
+            button_text="Bees and Other Noise",
+            image_filename=BUTTON_DICT['SPEAKER2'],
+            border_width=1,
+            pad=(0, 0),
+            key='BEES AND OTHER NOISE',
+            button_color=('white', self.default_bg_color),
+            enable_events=True
+        )
+
         # Column layout for media player button controls
         col1 = [[self.button('SKIP PREVIOUS', BUTTON_DICT['START']),
                  self.button('PAUSE', BUTTON_DICT['PAUSE_OFF']),
@@ -69,7 +102,9 @@ class MediaPlayer:
         # Main GUI layout
         main_layout = [
             # Media output element -- this is the video output element
-            [sg.Image(filename=DEFAULT_IMG, pad=(0, 5), size=self.player_size, key='VID_OUT')],
+            [bee_only_button, sg.Image(filename=DEFAULT_IMG, pad=(0, 5), size=self.player_size, key='VID_OUT'), bee_and_other_noise_button],
+
+            # Classification labels:
 
             # Element for tracking elapsed time
             [sg.Text('00:00', key='TIME_ELAPSED'),
@@ -128,6 +163,7 @@ class MediaPlayer:
             # Update the track counter
             if self.track_cnt == 1:
                 self.track_num = 1
+                self._track = track
                 self.list_player.play()
 
     def get_meta(self, meta_type):
@@ -179,6 +215,7 @@ class MediaPlayer:
         self.reset_pause_play()
         if not self.track_cnt == self.track_num:
             self.track_num += 1
+            self._track = None
 
     def skip_previous(self):
         """ Called when the skip previous button is pressed """
@@ -186,6 +223,7 @@ class MediaPlayer:
         self.reset_pause_play()
         if not self.track_num == 1:
             self.track_num -= 1
+            self._track = None
 
     def reset_pause_play(self):
         """ Reset pause play buttons after skipping tracks """
@@ -208,8 +246,60 @@ class MediaPlayer:
             self.window['INFO'].update('Loading media...')
             self.window.read(1)
             self.add_media(track)
+            self._track = track
         if self.media_list.count() > 0:
             self.play()
+
+    def label_track_bees_only(self):
+        """
+        This method is invoked when the "bees only" button is pressed in the GUI. This method flags the current track at
+        the relative time (second-level precision) that the button was pressed, as containing "bees only". The exact
+        aware (non-naive) datetime timestamp will be retained along with the relative time in seconds. The observed RMSE
+        for the playing source audio file (as calculated by the preceding NMF model) will be retained as well.
+
+        """
+        relative_second = self.player.get_time() // 1000
+        if relative_second != -1:
+            # Track is playing or paused.
+            if self.track_num not in self._bees_only_track_numbers:
+                self._bees_only_track_numbers.append(self.track_num)
+                # Convert local mounted network drive path to absolute server media path:
+                source_audio_file_path = local_mounted_network_drive_source_audio_path_to_remote_server_absolute_audio_path(local_mounted_path=self._track)
+                # .. todo:: Need to load in the RMSE values alongside the source audio file paths.
+                # .. todo:: Need to write helper method to go from audio file name and relative offset to non-naive datetime.
+                self._labeled_audio_files[source_audio_file_path] = {
+                    "label": 0,
+                    "relative_time": relative_second,
+                    "datetime": None,
+                    "rmse": None
+                }
+            logger.debug(f"Bees only at: {relative_second}")
+
+    def label_track_bees_and_other_noise(self):
+        """
+        This method is invoked when the "bees and other noise" button is pressed in the GUI. This method flags the
+        current track at the relative time (second-level precision) that the button was pressed, as containing
+        "bees and other noise". The exact aware (non-naive) datetime timestamp will be retained along with the relative
+        time in seconds. The observed RMSE for the playing source audio file (as calculated by the preceding NMF model)
+        will be retained as well.
+
+        """
+        relative_second = self.player.get_time() // 1000
+        if relative_second != -1:
+            # Track is playing or paused.
+            if self.track_num not in self._bees_and_other_noise_track_numbers:
+                self._bees_and_other_noise_track_numbers.append(self.track_num)
+                # Convert local mounted network drive path to absolute server media path:
+                source_audio_file_path = local_mounted_network_drive_source_audio_path_to_remote_server_absolute_audio_path(local_mounted_path=self._track)
+                # .. todo:: Need to load in the RMSE values alongside the source audio file paths.
+                # .. todo:: Need to write helper method to go from audio file name and relative offset to non-naive datetime.
+                self._labeled_audio_files[source_audio_file_path] = {
+                    "label": 1,
+                    "relative_time": relative_second,
+                    "datetime": None,
+                    "rmse": None
+                }
+            logger.debug(f"Bees and other noise at: {relative_second}")
 
     def load_playlist_from_file(self):
         """ Open text file and load to new media list. Assumes `playlist.txt` is in root directory """
@@ -239,6 +329,9 @@ class MediaPlayer:
         # Increment the track counter
         self.track_cnt = self.media_list.count()
         self.track_num = 1
+        self._previous_track = None
+        self._track = self.media_list[self.track_num]
+        self._next_track = self.media_list[self.track_num + 1]
 
 
 def main():
@@ -271,6 +364,10 @@ def main():
             mp.load_single_track()
         if event == 'PLAYLIST':
             mp.load_playlist_from_file()
+        if event == 'BEES ONLY':
+            mp.label_track_bees_only()
+        if event == 'BEES AND OTHER NOISE':
+            mp.label_track_bees_and_other_noise()
 
 
 if __name__ == '__main__':
